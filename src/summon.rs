@@ -1,4 +1,5 @@
-use std::{collections::HashMap, io, rc::Rc};
+use std::hash::Hash;
+use std::{cell::RefCell, collections::HashMap, io, rc::Rc};
 
 pub trait Summoner<Obj> {
     type Id;
@@ -46,25 +47,28 @@ pub struct GoFile {
 
 impl GoFile {
     pub fn from_gosyn_file(gosyn_file: gosyn::ast::File) -> Self {
-        let mut imports = HashMap::new();
-        let mut decls = HashMap::new();
+        let imports = Self::extract_imports(gosyn_file.imports);
+        let decls = Self::extract_decls(gosyn_file.decl);
 
-        for import in gosyn_file.imports {
-            let name = if let Some(name) = import.name {
-                name.name
-            } else {
-                let cells = import.path.value.split("/");
-                cells.last().expect("invalid import path").to_owned()
-            };
-
-            imports.insert(name, import.path.value);
+        Self {
+            pkg_name: gosyn_file.pkg_name.name,
+            line_info: gosyn_file.line_info,
+            docs: gosyn_file.docs,
+            imports,
+            decls,
+            comments: gosyn_file.comments,
         }
+    }
 
-        for decl in gosyn_file.decl {
+    fn extract_decls(
+        decls: Vec<gosyn::ast::Declaration>,
+    ) -> HashMap<String, gosyn::ast::Declaration> {
+        let mut ans = HashMap::new();
+        for decl in decls {
             match decl {
                 gosyn::ast::Declaration::Function(ref func_decl) => {
                     let name = func_decl.name.name.clone();
-                    decls.insert(name, decl);
+                    ans.insert(name, decl);
                 }
                 gosyn::ast::Declaration::Type(decl) => {
                     for d in decl.specs {
@@ -78,13 +82,44 @@ impl GoFile {
                 gosyn::ast::Declaration::Variable(_) => todo!(),
             };
         }
-        Self {
-            pkg_name: gosyn_file.pkg_name.name,
-            line_info: gosyn_file.line_info,
-            docs: gosyn_file.docs,
-            imports,
-            decls,
-            comments: gosyn_file.comments,
+        ans
+    }
+
+    fn extract_imports(imports: Vec<gosyn::ast::Import>) -> HashMap<String, String> {
+        let mut ans = HashMap::new();
+        for import in imports {
+            let name = if let Some(name) = import.name {
+                name.name
+            } else {
+                let cells = import.path.value.split("/");
+                cells.last().expect("invalid import path").to_owned()
+            };
+
+            ans.insert(name, import.path.value);
         }
+        ans
+    }
+}
+
+pub struct CachedSummoner<Obj, S: Summoner<Obj>> {
+    summoner: S,
+    pub cache: RefCell<HashMap<S::Id, Rc<Obj>>>,
+}
+
+impl<Obj, S: Summoner<Obj, Id: ?Sized>> Summoner<Rc<Obj>> for CachedSummoner<Obj, S>
+where
+    S::Id: Hash + Eq + Clone,
+{
+    type Id = S::Id;
+    type Err = S::Err;
+
+    fn summon(&self, id: Self::Id) -> Result<Rc<Obj>, Self::Err> {
+        if let Some(obj) = self.cache.borrow().get(&id) {
+            return Ok(obj.clone());
+        }
+
+        let obj = Rc::new(self.summoner.summon(id.clone())?);
+        self.cache.borrow_mut().insert(id, obj.clone());
+        Ok(obj)
     }
 }
