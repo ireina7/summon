@@ -1,30 +1,35 @@
-use std::{collections::HashMap, io, rc::Rc};
+#![allow(dead_code)]
 
-#[allow(dead_code)]
-pub struct FileLocation {
-    line: usize,
-    column: usize,
+use reading_liner::location::line_column;
+use std::{collections::HashMap, hash::Hash, io, marker::PhantomData, mem, path, rc::Rc};
+
+use crate::summon::Summoner;
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct FileLocationId<P> {
+    file_path: P,
+    location: line_column::ZeroBased,
 }
 
-#[allow(dead_code)]
-pub struct FileLocationId {
-    file_path: String,
-    name: Rc<str>,
-    location: Option<FileLocation>,
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct GoSymbol(String);
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct GoSymbolId<P> {
+    path: P,
+    symbol: GoSymbol,
 }
 
-#[allow(dead_code)]
-pub struct GoSymbolId {
-    project_path: String,
-    symbol: String,
-}
-
-#[allow(dead_code)]
-fn summon_by_file_location(id: FileLocationId) -> io::Result<gosyn::ast::File> {
-    let file = gosyn::parse_file(&id.file_path)
-        .map_err(|err| io::Error::new(io::ErrorKind::Other, err))?;
+fn summon_raw_by_file_path<P: AsRef<path::Path>>(id: P) -> io::Result<gosyn::ast::File> {
+    let file =
+        gosyn::parse_file(id.as_ref()).map_err(|err| io::Error::new(io::ErrorKind::Other, err))?;
 
     Ok(file)
+}
+
+fn summon_by_file_path(id: impl AsRef<path::Path>) -> io::Result<GoFile> {
+    let gosyn_file = summon_raw_by_file_path(id)?;
+    Ok(GoFile::from(gosyn_file))
 }
 
 // #[derive(Default, Debug, Clone)]
@@ -38,6 +43,7 @@ fn summon_by_file_location(id: FileLocationId) -> io::Result<gosyn::ast::File> {
 //     pub decl: Vec<Declaration>,
 //     pub comments: Vec<Rc<Comment>>,
 // }
+#[derive(Debug)]
 pub struct GoFile {
     pub pkg_name: String,
     pub line_info: Vec<usize>,
@@ -72,16 +78,40 @@ impl GoFile {
                     let name = func_decl.name.name.clone();
                     ans.insert(name, decl);
                 }
-                gosyn::ast::Declaration::Type(decl) => {
-                    for d in decl.specs {
+                gosyn::ast::Declaration::Type(mut decl) => {
+                    let ds = mem::take(&mut decl.specs);
+                    for d in ds {
+                        let mut header = decl.clone();
                         let name = d.name.name.clone();
-                        // decls.insert(name, gosyn::ast::Declaration::Type(d));
-                        todo!()
+                        header.specs = vec![d];
+                        ans.insert(name, gosyn::ast::Declaration::Type(header));
                     }
-                    todo!()
                 }
-                gosyn::ast::Declaration::Const(_) => todo!(),
-                gosyn::ast::Declaration::Variable(_) => todo!(),
+                gosyn::ast::Declaration::Const(mut decl) => {
+                    let specs = mem::take(&mut decl.specs);
+                    for spec in specs {
+                        let mut header = decl.clone();
+                        let names = spec.name.clone();
+                        header.specs = vec![spec];
+                        for name in names {
+                            ans.insert(name.name, gosyn::ast::Declaration::Const(header.clone()));
+                        }
+                    }
+                }
+                gosyn::ast::Declaration::Variable(mut decl) => {
+                    let specs = mem::take(&mut decl.specs);
+                    for spec in specs {
+                        let mut header = decl.clone();
+                        let names = spec.name.clone();
+                        header.specs = vec![spec];
+                        for name in names {
+                            ans.insert(
+                                name.name,
+                                gosyn::ast::Declaration::Variable(header.clone()),
+                            );
+                        }
+                    }
+                }
             };
         }
         ans
@@ -100,5 +130,103 @@ impl GoFile {
             ans.insert(name, import.path.value);
         }
         ans
+    }
+}
+
+impl From<gosyn::ast::File> for GoFile {
+    fn from(value: gosyn::ast::File) -> Self {
+        Self::from_gosyn_file(value)
+    }
+}
+
+pub struct GoFileSummoner<P> {
+    _data: PhantomData<P>,
+}
+
+impl<P> GoFileSummoner<P> {
+    pub fn new() -> Self {
+        Self { _data: PhantomData }
+    }
+}
+
+impl<P> Default for GoFileSummoner<P> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl<P: AsRef<path::Path>> Summoner<GoFile> for GoFileSummoner<P> {
+    type Id = P;
+    type Err = io::Error;
+
+    fn summon(&self, id: Self::Id) -> Result<GoFile, Self::Err> {
+        summon_by_file_path(id)
+    }
+}
+
+pub struct GoDeclSummoner<P> {
+    _data: PhantomData<P>,
+}
+
+impl<P> GoDeclSummoner<P> {
+    pub fn new() -> Self {
+        Self { _data: PhantomData }
+    }
+}
+
+impl<P> Default for GoDeclSummoner<P> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl<P: AsRef<path::Path>> Summoner<gosyn::ast::Declaration> for GoDeclSummoner<P> {
+    type Id = GoSymbolId<P>;
+    type Err = io::Error;
+
+    fn summon(&self, id: Self::Id) -> Result<gosyn::ast::Declaration, Self::Err> {
+        let file = summon_by_file_path(id.path)?;
+        if let Some(decl) = file.decls.get(&id.symbol.0) {
+            return Ok(decl.clone());
+        }
+        Err(io::Error::new(
+            io::ErrorKind::Other,
+            format!("symbol {} not found", id.symbol.0),
+        ))
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+    use crate::summon::CachedSummoner;
+
+    #[test]
+    fn test_summon_gofile() {
+        let path = "/Users/comcx/Workspace/Repo/void/main.go";
+        let summoner = GoFileSummoner::new();
+        let summoner = CachedSummoner::new(summoner);
+        let file = Summoner::<Rc<GoFile>>::summon(&summoner, path);
+        dbg!(file.unwrap());
+
+        let retrieve = summoner.summon(path);
+        dbg!(retrieve.unwrap());
+    }
+
+    #[test]
+    fn test_summon_gosymbol() {
+        let path = "/Users/comcx/Workspace/Repo/void/main.go";
+        let summoner = GoDeclSummoner::new();
+        let summoner = CachedSummoner::new(summoner);
+
+        let id = GoSymbolId {
+            path,
+            symbol: GoSymbol("main".to_owned()),
+        };
+        let file = summoner.summon(id.clone());
+        dbg!(file.unwrap());
+
+        let retrieve = summoner.summon(id);
+        dbg!(retrieve.unwrap());
     }
 }

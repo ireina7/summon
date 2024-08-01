@@ -5,3 +5,5 @@ edition = "2021"
 
 [dependencies]
 gosyn = "0.2.9"
+lru = "0.12.4"
+reading-liner = "0.1"
